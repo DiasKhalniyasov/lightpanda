@@ -65,4 +65,4 @@ COPY --from=0 /browser/zig-out/bin/lightpanda /bin/lightpanda
 
 EXPOSE 9222/tcp
 
-CMD ["/bin/lightpanda", "serve", "--host", "0.0.0.0", "--port", "9222"]
+CMD ["sh","-lc","/bin/lightpanda serve --host 0.0.0.0 --port ${PORT:-9222}"]
