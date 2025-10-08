@@ -37,7 +37,7 @@ pub fn reset() void {
 }
 
 const App = @import("app.zig").App;
-const Env = @import("browser/env.zig").Env;
+const js = @import("browser/js/js.zig");
 const Browser = @import("browser/browser.zig").Browser;
 const Session = @import("browser/session.zig").Session;
 const parser = @import("browser/netsurf.zig");
@@ -395,8 +395,8 @@ pub fn htmlRunner(file: []const u8) !void {
 
     page.arena = @import("root").tracking_allocator;
 
-    const js_context = page.main_context;
-    var try_catch: Env.TryCatch = undefined;
+    const js_context = page.js;
+    var try_catch: js.TryCatch = undefined;
     try_catch.init(js_context);
     defer try_catch.deinit();
 
@@ -409,7 +409,7 @@ pub fn htmlRunner(file: []const u8) !void {
     page.session.browser.runMessageLoop();
 
     const needs_second_wait = try js_context.exec("testing._onPageWait.length > 0", "check_onPageWait");
-    if (needs_second_wait.value.toBool(page.main_context.isolate)) {
+    if (needs_second_wait.value.toBool(page.js.isolate)) {
         // sets the isSecondWait flag in testing.
         _ = js_context.exec("testing._isSecondWait = true", "set_second_wait_flag") catch {};
         _ = page.wait(2000);

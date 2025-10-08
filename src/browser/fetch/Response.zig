@@ -17,9 +17,8 @@
 // along with this program.  If not, see <https://www.gnu.org/licenses/>.
 
 const std = @import("std");
+const js = @import("../js/js.zig");
 const log = @import("../../log.zig");
-
-const v8 = @import("v8");
 
 const HttpClient = @import("../../http/Client.zig");
 const Http = @import("../../http/Http.zig");
@@ -29,7 +28,6 @@ const ReadableStream = @import("../streams/ReadableStream.zig");
 const Headers = @import("Headers.zig");
 const HeadersInit = @import("Headers.zig").HeadersInit;
 
-const Env = @import("../env.zig").Env;
 const Mime = @import("../mime.zig").Mime;
 const Page = @import("../page.zig").Page;
 
@@ -165,29 +163,22 @@ pub fn _clone(self: *const Response) !Response {
     };
 }
 
-pub fn _bytes(self: *Response, page: *Page) !Env.Promise {
+pub fn _bytes(self: *Response, page: *Page) !js.Promise {
     if (self.body_used) {
         return error.TypeError;
     }
 
-    const resolver = Env.PromiseResolver{
-        .js_context = page.main_context,
-        .resolver = v8.PromiseResolver.init(page.main_context.v8_context),
-    };
-
-    try resolver.resolve(self.body);
     self.body_used = true;
-    return resolver.promise();
+    return page.js.resolvePromise(self.body);
 }
 
-pub fn _json(self: *Response, page: *Page) !Env.Promise {
+pub fn _json(self: *Response, page: *Page) !js.Promise {
     if (self.body_used) {
         return error.TypeError;
     }
 
-    const resolver = page.main_context.createPromiseResolver();
-
     if (self.body) |body| {
+        self.body_used = true;
         const p = std.json.parseFromSliceLeaky(
             std.json.Value,
             page.call_arena,
@@ -198,25 +189,18 @@ pub fn _json(self: *Response, page: *Page) !Env.Promise {
             return error.SyntaxError;
         };
 
-        try resolver.resolve(p);
-    } else {
-        try resolver.resolve(null);
+        return page.js.resolvePromise(p);
     }
-
-    self.body_used = true;
-    return resolver.promise();
+    return page.js.resolvePromise(null);
 }
 
-pub fn _text(self: *Response, page: *Page) !Env.Promise {
+pub fn _text(self: *Response, page: *Page) !js.Promise {
     if (self.body_used) {
         return error.TypeError;
     }
-
-    const resolver = page.main_context.createPromiseResolver();
-
-    try resolver.resolve(self.body);
     self.body_used = true;
-    return resolver.promise();
+
+    return page.js.resolvePromise(self.body);
 }
 
 const testing = @import("../../testing.zig");

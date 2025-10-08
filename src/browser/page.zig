@@ -23,7 +23,6 @@ const Allocator = std.mem.Allocator;
 
 const Dump = @import("dump.zig");
 const State = @import("State.zig");
-const Env = @import("env.zig").Env;
 const Mime = @import("mime.zig").Mime;
 const Session = @import("session.zig").Session;
 const Renderer = @import("renderer.zig").Renderer;
@@ -35,6 +34,7 @@ const ScriptManager = @import("ScriptManager.zig");
 const SlotChangeMonitor = @import("SlotChangeMonitor.zig");
 const HTMLDocument = @import("html/document.zig").HTMLDocument;
 
+const js = @import("js/js.zig");
 const URL = @import("../url.zig").URL;
 
 const log = @import("../log.zig");
@@ -74,7 +74,7 @@ pub const Page = struct {
 
     // Our JavaScript context for this specific page. This is what we use to
     // execute any JavaScript
-    main_context: *Env.JsContext,
+    js: *js.Context,
 
     // indicates intention to navigate to another page on the next loop execution.
     delayed_navigation: bool = false,
@@ -121,7 +121,7 @@ pub const Page = struct {
         complete,
     };
 
-    pub fn init(self: *Page, arena: Allocator, session: *Session) !void {
+    pub fn init(self: *Page, arena: Allocator, call_arena: Allocator, session: *Session) !void {
         const browser = session.browser;
         const script_manager = ScriptManager.init(browser, self);
 
@@ -131,7 +131,7 @@ pub const Page = struct {
             .window = try Window.create(null, null),
             .arena = arena,
             .session = session,
-            .call_arena = undefined,
+            .call_arena = call_arena,
             .renderer = Renderer.init(arena),
             .state_pool = &browser.state_pool,
             .cookie_jar = &session.cookie_jar,
@@ -140,11 +140,11 @@ pub const Page = struct {
             .scheduler = Scheduler.init(arena),
             .keydown_event_node = .{ .func = keydownCallback },
             .window_clicked_event_node = .{ .func = windowClicked },
-            .main_context = undefined,
+            .js = undefined,
         };
 
-        self.main_context = try session.executor.createJsContext(&self.window, self, &self.script_manager, true, Env.GlobalMissingCallback.init(&self.polyfill_loader));
-        try polyfill.preload(self.arena, self.main_context);
+        self.js = try session.executor.createContext(self, true, js.GlobalMissingCallback.init(&self.polyfill_loader));
+        try polyfill.preload(self.arena, self.js);
 
         try self.scheduler.add(self, runMicrotasks, 5, .{ .name = "page.microtasks" });
         // message loop must run only non-test env
@@ -276,8 +276,8 @@ pub const Page = struct {
         var timer = try std.time.Timer.start();
         var ms_remaining = wait_ms;
 
-        var try_catch: Env.TryCatch = undefined;
-        try_catch.init(self.main_context);
+        var try_catch: js.TryCatch = undefined;
+        try_catch.init(self.js);
         defer try_catch.deinit();
 
         var scheduler = &self.scheduler;
@@ -785,7 +785,7 @@ pub const Page = struct {
                         // ignore non-js script.
                         continue;
                     }
-                    try self.script_manager.addFromElement(@ptrCast(node));
+                    try self.script_manager.addFromElement(@ptrCast(node), "page");
                 }
 
                 self.script_manager.staticScriptsDone();
@@ -1116,7 +1116,7 @@ pub const Page = struct {
 
     pub fn stackTrace(self: *Page) !?[]const u8 {
         if (comptime builtin.mode == .Debug) {
-            return self.main_context.stackTrace();
+            return self.js.stackTrace();
         }
         return null;
     }
@@ -1250,7 +1250,7 @@ pub export fn scriptAddedCallback(ctx: ?*anyopaque, element: ?*parser.Element) c
     // here, else the script_manager will flag it as already-processed.
     _ = parser.elementGetAttribute(element.?, "src") catch return orelse return;
 
-    self.script_manager.addFromElement(element.?) catch |err| {
+    self.script_manager.addFromElement(element.?, "dynamic") catch |err| {
         log.warn(.browser, "dynamic script", .{ .err = err });
     };
 }

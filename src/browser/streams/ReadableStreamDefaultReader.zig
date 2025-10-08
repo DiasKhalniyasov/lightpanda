@@ -18,8 +18,8 @@
 
 const std = @import("std");
 
+const js = @import("../js/js.zig");
 const log = @import("../../log.zig");
-const Env = @import("../env.zig").Env;
 const Page = @import("../page.zig").Page;
 const ReadableStream = @import("./ReadableStream.zig");
 const ReadableStreamReadResult = @import("./ReadableStream.zig").ReadableStreamReadResult;
@@ -32,58 +32,41 @@ pub fn constructor(stream: *ReadableStream) ReadableStreamDefaultReader {
     return .{ .stream = stream };
 }
 
-pub fn get_closed(self: *const ReadableStreamDefaultReader) Env.Promise {
+pub fn get_closed(self: *const ReadableStreamDefaultReader) js.Promise {
     return self.stream.closed_resolver.promise();
 }
 
-pub fn _cancel(self: *ReadableStreamDefaultReader, reason: ?[]const u8, page: *Page) !Env.Promise {
+pub fn _cancel(self: *ReadableStreamDefaultReader, reason: ?[]const u8, page: *Page) !js.Promise {
     return try self.stream._cancel(reason, page);
 }
 
-pub fn _read(self: *const ReadableStreamDefaultReader, page: *Page) !Env.Promise {
+pub fn _read(self: *const ReadableStreamDefaultReader, page: *Page) !js.Promise {
     const stream = self.stream;
 
     switch (stream.state) {
         .readable => {
             if (stream.queue.items.len > 0) {
                 const data = self.stream.queue.orderedRemove(0);
-                const resolver = page.main_context.createPromiseResolver();
-
-                try resolver.resolve(ReadableStreamReadResult.init(data, false));
+                const promise = page.js.resolvePromise(ReadableStreamReadResult.init(data, false));
                 try self.stream.pullIf();
-                return resolver.promise();
-            } else {
-                if (self.stream.reader_resolver) |rr| {
-                    return rr.promise();
-                } else {
-                    const persistent_resolver = try page.main_context.createPersistentPromiseResolver(.page);
-                    self.stream.reader_resolver = persistent_resolver;
-                    return persistent_resolver.promise();
-                }
+                return promise;
             }
+            if (self.stream.reader_resolver) |rr| {
+                return rr.promise();
+            }
+            const persistent_resolver = try page.js.createPromiseResolver(.page);
+            self.stream.reader_resolver = persistent_resolver;
+            return persistent_resolver.promise();
         },
         .closed => |_| {
-            const resolver = page.main_context.createPromiseResolver();
-
             if (stream.queue.items.len > 0) {
                 const data = self.stream.queue.orderedRemove(0);
-                try resolver.resolve(ReadableStreamReadResult.init(data, false));
-            } else {
-                try resolver.resolve(ReadableStreamReadResult{ .done = true });
+                return page.js.resolvePromise(ReadableStreamReadResult.init(data, false));
             }
-
-            return resolver.promise();
+            return page.js.resolvePromise(ReadableStreamReadResult{ .done = true });
         },
-        .cancelled => |_| {
-            const resolver = page.main_context.createPromiseResolver();
-            try resolver.resolve(ReadableStreamReadResult{ .value = .empty, .done = true });
-            return resolver.promise();
-        },
-        .errored => |err| {
-            const resolver = page.main_context.createPromiseResolver();
-            try resolver.reject(err);
-            return resolver.promise();
-        },
+        .cancelled => |_| return page.js.resolvePromise(ReadableStreamReadResult{ .value = .empty, .done = true }),
+        .errored => |err| return page.js.rejectPromise(err),
     }
 }
 

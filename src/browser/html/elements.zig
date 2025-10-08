@@ -18,9 +18,9 @@
 const std = @import("std");
 const log = @import("../../log.zig");
 
+const js = @import("../js/js.zig");
 const parser = @import("../netsurf.zig");
-const generate = @import("../../runtime/generate.zig");
-const Env = @import("../env.zig").Env;
+const generate = @import("../js/generate.zig");
 const Page = @import("../page.zig").Page;
 
 const urlStitch = @import("../../url.zig").URL.stitch;
@@ -887,7 +887,7 @@ pub const HTMLScriptElement = struct {
             //    s.src = '...';
             // This should load the script.
             // addFromElement protects against double execution.
-            try page.script_manager.addFromElement(@ptrCast(@alignCast(self)));
+            try page.script_manager.addFromElement(@ptrCast(@alignCast(self)), "dynamic");
         }
     }
 
@@ -1000,22 +1000,22 @@ pub const HTMLScriptElement = struct {
         );
     }
 
-    pub fn get_onload(self: *parser.Script, page: *Page) !?Env.Function {
+    pub fn get_onload(self: *parser.Script, page: *Page) !?js.Function {
         const state = page.getNodeState(@ptrCast(@alignCast(self))) orelse return null;
         return state.onload;
     }
 
-    pub fn set_onload(self: *parser.Script, function: ?Env.Function, page: *Page) !void {
+    pub fn set_onload(self: *parser.Script, function: ?js.Function, page: *Page) !void {
         const state = try page.getOrCreateNodeState(@ptrCast(@alignCast(self)));
         state.onload = function;
     }
 
-    pub fn get_onerror(self: *parser.Script, page: *Page) !?Env.Function {
+    pub fn get_onerror(self: *parser.Script, page: *Page) !?js.Function {
         const state = page.getNodeState(@ptrCast(@alignCast(self))) orelse return null;
         return state.onerror;
     }
 
-    pub fn set_onerror(self: *parser.Script, function: ?Env.Function, page: *Page) !void {
+    pub fn set_onerror(self: *parser.Script, function: ?js.Function, page: *Page) !void {
         const state = try page.getOrCreateNodeState(@ptrCast(@alignCast(self)));
         state.onerror = function;
     }

@@ -18,9 +18,9 @@
 
 const std = @import("std");
 
+const js = @import("../js/js.zig");
 const log = @import("../../log.zig");
 const parser = @import("../netsurf.zig");
-const Env = @import("../env.zig").Env;
 const Page = @import("../page.zig").Page;
 
 const Navigator = @import("navigator.zig").Navigator;
@@ -37,9 +37,6 @@ const domcss = @import("../dom/css.zig");
 const Css = @import("../css/css.zig").Css;
 const EventHandler = @import("../events/event.zig").EventHandler;
 
-const Function = Env.Function;
-
-const v8 = @import("v8");
 const Request = @import("../fetch/Request.zig");
 const fetchFn = @import("../fetch/fetch.zig").fetch;
 
@@ -68,7 +65,9 @@ pub const Window = struct {
     performance: Performance,
     screen: Screen = .{},
     css: Css = .{},
-    onload_callback: ?Function = null,
+    scroll_x: u32 = 0,
+    scroll_y: u32 = 0,
+    onload_callback: ?js.Function = null,
 
     pub fn create(target: ?[]const u8, navigator: ?Navigator) !Window {
         var fbs = std.io.fixedBufferStream("");
@@ -99,12 +98,12 @@ pub const Window = struct {
         self.storage_shelf = shelf;
     }
 
-    pub fn _fetch(_: *Window, input: Request.RequestInput, options: ?Request.RequestInit, page: *Page) !Env.Promise {
+    pub fn _fetch(_: *Window, input: Request.RequestInput, options: ?Request.RequestInit, page: *Page) !js.Promise {
         return fetchFn(input, options, page);
     }
 
     /// Returns `onload_callback`.
-    pub fn get_onload(self: *const Window) ?Function {
+    pub fn get_onload(self: *const Window) ?js.Function {
         return self.onload_callback;
     }
 
@@ -256,7 +255,7 @@ pub const Window = struct {
         return &self.css;
     }
 
-    pub fn _requestAnimationFrame(self: *Window, cbk: Function, page: *Page) !u32 {
+    pub fn _requestAnimationFrame(self: *Window, cbk: js.Function, page: *Page) !u32 {
         return self.createTimeout(cbk, 5, page, .{
             .animation_frame = true,
             .name = "animationFrame",
@@ -268,11 +267,11 @@ pub const Window = struct {
         _ = self.timers.remove(id);
     }
 
-    pub fn _setTimeout(self: *Window, cbk: Function, delay: ?u32, params: []Env.JsObject, page: *Page) !u32 {
+    pub fn _setTimeout(self: *Window, cbk: js.Function, delay: ?u32, params: []js.Object, page: *Page) !u32 {
         return self.createTimeout(cbk, delay, page, .{ .args = params, .name = "setTimeout" });
     }
 
-    pub fn _setInterval(self: *Window, cbk: Function, delay: ?u32, params: []Env.JsObject, page: *Page) !u32 {
+    pub fn _setInterval(self: *Window, cbk: js.Function, delay: ?u32, params: []js.Object, page: *Page) !u32 {
         return self.createTimeout(cbk, delay, page, .{ .repeat = true, .args = params, .name = "setInterval" });
     }
 
@@ -284,11 +283,11 @@ pub const Window = struct {
         _ = self.timers.remove(id);
     }
 
-    pub fn _queueMicrotask(self: *Window, cbk: Function, page: *Page) !u32 {
+    pub fn _queueMicrotask(self: *Window, cbk: js.Function, page: *Page) !u32 {
         return self.createTimeout(cbk, 0, page, .{ .name = "queueMicrotask" });
     }
 
-    pub fn _setImmediate(self: *Window, cbk: Function, page: *Page) !u32 {
+    pub fn _setImmediate(self: *Window, cbk: js.Function, page: *Page) !u32 {
         return self.createTimeout(cbk, 0, page, .{ .name = "setImmediate" });
     }
 
@@ -296,7 +295,7 @@ pub const Window = struct {
         _ = self.timers.remove(id);
     }
 
-    pub fn _matchMedia(_: *const Window, media: Env.String) !MediaQueryList {
+    pub fn _matchMedia(_: *const Window, media: js.String) !MediaQueryList {
         return .{
             .matches = false, // TODO?
             .media = media.string,
@@ -320,12 +319,12 @@ pub const Window = struct {
 
     const CreateTimeoutOpts = struct {
         name: []const u8,
-        args: []Env.JsObject = &.{},
+        args: []js.Object = &.{},
         repeat: bool = false,
         animation_frame: bool = false,
         low_priority: bool = false,
     };
-    fn createTimeout(self: *Window, cbk: Function, delay_: ?u32, page: *Page, opts: CreateTimeoutOpts) !u32 {
+    fn createTimeout(self: *Window, cbk: js.Function, delay_: ?u32, page: *Page, opts: CreateTimeoutOpts) !u32 {
         const delay = delay_ orelse 0;
         if (self.timers.count() > 512) {
             return error.TooManyTimeout;
@@ -345,9 +344,9 @@ pub const Window = struct {
         errdefer _ = self.timers.remove(timer_id);
 
         const args = opts.args;
-        var persisted_args: []Env.JsObject = &.{};
+        var persisted_args: []js.Object = &.{};
         if (args.len > 0) {
-            persisted_args = try page.arena.alloc(Env.JsObject, args.len);
+            persisted_args = try page.arena.alloc(js.Object, args.len);
             for (args, persisted_args) |a, *ca| {
                 ca.* = try a.persist();
             }
@@ -388,12 +387,20 @@ pub const Window = struct {
         const Opts = struct {
             top: i32,
             left: i32,
-            behavior: []const u8,
+            behavior: []const u8 = "",
         };
     };
-    pub fn _scrollTo(self: *Window, opts: ScrollToOpts, y: ?u32) !void {
-        _ = opts;
-        _ = y;
+    pub fn _scrollTo(self: *Window, opts: ScrollToOpts, y: ?i32) !void {
+        switch (opts) {
+            .x => |x| {
+                self.scroll_x = @intCast(@max(x, 0));
+                self.scroll_y = @intCast(@max(0, y orelse 0));
+            },
+            .opts => |o| {
+                self.scroll_y = @intCast(@max(0, o.top));
+                self.scroll_x = @intCast(@max(0, o.left));
+            },
+        }
 
         {
             const scroll_event = try parser.eventCreate();
@@ -416,6 +423,28 @@ pub const Window = struct {
                 scroll_end,
             );
         }
+    }
+    pub fn _scroll(self: *Window, opts: ScrollToOpts, y: ?i32) !void {
+        // just an alias for scrollTo
+        return self._scrollTo(opts, y);
+    }
+
+    pub fn get_scrollX(self: *const Window) u32 {
+        return self.scroll_x;
+    }
+
+    pub fn get_scrollY(self: *const Window) u32 {
+        return self.scroll_y;
+    }
+
+    pub fn get_pageXOffset(self: *const Window) u32 {
+        // just an alias for scrollX
+        return self.get_scrollX();
+    }
+
+    pub fn get_pageYOffset(self: *const Window) u32 {
+        // just an alias for scrollY
+        return self.get_scrollY();
     }
 
     // libdom's document doesn't have a parent, which is correct, but
@@ -444,13 +473,13 @@ const TimerCallback = struct {
     repeat: ?u32,
 
     // The JavaScript callback to execute
-    cbk: Function,
+    cbk: js.Function,
 
     animation_frame: bool = false,
 
     window: *Window,
 
-    args: []Env.JsObject = &.{},
+    args: []js.Object = &.{},
 
     fn run(ctx: *anyopaque) ?u32 {
         const self: *TimerCallback = @ptrCast(@alignCast(ctx));
@@ -464,7 +493,7 @@ const TimerCallback = struct {
             return null;
         }
 
-        var result: Function.Result = undefined;
+        var result: js.Function.Result = undefined;
 
         var call: anyerror!void = undefined;
         if (self.animation_frame) {

@@ -18,10 +18,10 @@
 
 const std = @import("std");
 
+const js = @import("js/js.zig");
 const log = @import("../log.zig");
 const parser = @import("netsurf.zig");
 
-const Env = @import("env.zig").Env;
 const Page = @import("page.zig").Page;
 const DataURI = @import("DataURI.zig");
 const Http = @import("../http/Http.zig");
@@ -38,21 +38,12 @@ page: *Page,
 // used to prevent recursive evalutaion
 is_evaluating: bool,
 
-// used to prevent executing scripts while we're doing a blocking load
-is_blocking: bool = false,
-
 // Only once this is true can deferred scripts be run
 static_scripts_done: bool,
 
 // List of async scripts. We don't care about the execution order of these, but
 // on shutdown/abort, we need to cleanup any pending ones.
 asyncs: OrderList,
-
-// When an async script is ready to be evaluated, it's moved from asyncs to
-// this list. You might think we can evaluate an async script as soon as it's
-// done, but we can only evaluate scripts when `is_blocking == false`. So this
-// becomes a list of scripts to execute on the next evaluate().
-asyncs_ready: OrderList,
 
 // Normal scripts (non-deferred & non-async). These must be executed in order
 scripts: OrderList,
@@ -89,7 +80,6 @@ pub fn init(browser: *Browser, page: *Page) ScriptManager {
         .asyncs = .{},
         .scripts = .{},
         .deferreds = .{},
-        .asyncs_ready = .{},
         .sync_modules = .empty,
         .is_evaluating = false,
         .allocator = allocator,
@@ -129,7 +119,6 @@ pub fn reset(self: *ScriptManager) void {
     self.clearList(&self.asyncs);
     self.clearList(&self.scripts);
     self.clearList(&self.deferreds);
-    self.clearList(&self.asyncs_ready);
     self.static_scripts_done = false;
 }
 
@@ -142,7 +131,7 @@ fn clearList(_: *const ScriptManager, list: *OrderList) void {
     std.debug.assert(list.first == null);
 }
 
-pub fn addFromElement(self: *ScriptManager, element: *parser.Element) !void {
+pub fn addFromElement(self: *ScriptManager, element: *parser.Element, comptime ctx: []const u8) !void {
     if (try parser.elementGetAttribute(element, "nomodule") != null) {
         // these scripts should only be loaded if we don't support modules
         // but since we do support modules, we can just skip them.
@@ -230,7 +219,11 @@ pub fn addFromElement(self: *ScriptManager, element: *parser.Element) !void {
         self.scripts.append(&pending_script.node);
         return;
     } else {
-        log.debug(.http, "script queue", .{ .url = remote_url.? });
+        log.debug(.http, "script queue", .{
+            .ctx = ctx,
+            .url = remote_url.?,
+            .stack = page.js.stackTrace() catch "???",
+        });
     }
 
     pending_script.getList().append(&pending_script.node);
@@ -255,40 +248,7 @@ pub fn addFromElement(self: *ScriptManager, element: *parser.Element) !void {
     });
 }
 
-// @TODO: Improving this would have the simplest biggest performance improvement
-// for most sites.
-//
-// For JS imports (both static and dynamic), we currently block to get the
-// result (the content of the file).
-//
-// For static imports, this is necessary, since v8 is expecting the compiled module
-// as part of the function return. (we should try to pre-load the JavaScript
-// source via module.GetModuleRequests(), but that's for a later time).
-//
-// For dynamic dynamic imports, this is not strictly necessary since the v8
-// call returns a Promise; we could make this a normal get call, associated with
-// the promise, and when done, resolve the promise.
-//
-// In both cases, for now at least, we just issue a "blocking" request. We block
-// by ticking the http client until the script is complete.
-//
-// This uses the client.blockingRequest call which has a dedicated handle for
-// these blocking requests. Because they are blocking, we're guaranteed to have
-// only 1 at a time, thus the 1 reserved handle.
-//
-// You almost don't need the http client's blocking handle. In most cases, you
-// should always have 1 free handle whenever you get here, because we always
-// release the handle before executing the doneCallback. So, if a module does:
-//    import * as x from 'blah'
-// And we need to load 'blah', there should always be 1 free handle - the handle
-// of the http GET we just completed before executing the module.
-// The exception to this, and the reason we need a special blocking handle, is
-// for inline modules within the HTML page itself:
-//    <script type=module>import ....</script>
-// Unlike external modules which can only ever be executed after releasing an
-// http handle, these are executed without there necessarily being a free handle.
-// Thus, Http/Client.zig maintains a dedicated handle for these calls.
-pub fn getModule(self: *ScriptManager, url: [:0]const u8) !void {
+pub fn getModule(self: *ScriptManager, url: [:0]const u8, referrer: []const u8) !void {
     const gop = try self.sync_modules.getOrPut(self.allocator, url);
     if (gop.found_existing) {
         // already requested
@@ -304,6 +264,13 @@ pub fn getModule(self: *ScriptManager, url: [:0]const u8) !void {
 
     var headers = try self.client.newHeaders();
     try self.page.requestCookie(.{}).headersForRequest(self.page.arena, url, &headers);
+
+    log.debug(.http, "script queue", .{
+        .url = url,
+        .ctx = "module",
+        .referrer = referrer,
+        .stack = self.page.js.stackTrace() catch "???",
+    });
 
     try self.client.request(.{
         .url = url,
@@ -321,10 +288,6 @@ pub fn getModule(self: *ScriptManager, url: [:0]const u8) !void {
 }
 
 pub fn waitForModule(self: *ScriptManager, url: [:0]const u8) !GetResult {
-    std.debug.assert(self.is_blocking == false);
-    self.is_blocking = true;
-    defer self.is_blocking = false;
-
     // Normally it's dangerous to hold on to map pointers. But here, the map
     // can't change. It's possible that by calling `tick`, other entries within
     // the map will have their value change, but the map itself is immutable
@@ -355,7 +318,7 @@ pub fn waitForModule(self: *ScriptManager, url: [:0]const u8) !GetResult {
     }
 }
 
-pub fn getAsyncModule(self: *ScriptManager, url: [:0]const u8, cb: AsyncModule.Callback, cb_data: *anyopaque) !void {
+pub fn getAsyncModule(self: *ScriptManager, url: [:0]const u8, cb: AsyncModule.Callback, cb_data: *anyopaque, referrer: []const u8) !void {
     const async = try self.async_module_pool.create();
     errdefer self.async_module_pool.destroy(async);
 
@@ -367,6 +330,13 @@ pub fn getAsyncModule(self: *ScriptManager, url: [:0]const u8, cb: AsyncModule.C
 
     var headers = try self.client.newHeaders();
     try self.page.requestCookie(.{}).headersForRequest(self.page.arena, url, &headers);
+
+    log.debug(.http, "script queue", .{
+        .url = url,
+        .ctx = "dynamic module",
+        .referrer = referrer,
+        .stack = self.page.js.stackTrace() catch "???",
+    });
 
     try self.client.request(.{
         .url = url,
@@ -398,23 +368,9 @@ fn evaluate(self: *ScriptManager) void {
         return;
     }
 
-    if (self.is_blocking) {
-        // Cannot evaluate scripts while a blocking-load is in progress. Not
-        // only could that result in incorrect evaluation order, it could
-        // trigger another blocking request, while we're doing a blocking request.
-        return;
-    }
-
     const page = self.page;
     self.is_evaluating = true;
     defer self.is_evaluating = false;
-
-    // every script in asyncs_ready is ready to be evaluated.
-    while (self.asyncs_ready.first) |n| {
-        var pending_script: *PendingScript = @fieldParentPtr("node", n);
-        defer pending_script.deinit();
-        pending_script.script.eval(page);
-    }
 
     while (self.scripts.first) |n| {
         var pending_script: *PendingScript = @fieldParentPtr("node", n);
@@ -573,11 +529,13 @@ pub const PendingScript = struct {
 
         const manager = self.manager;
         self.complete = true;
-        if (self.script.is_async) {
-            manager.asyncs.remove(&self.node);
-            manager.asyncs_ready.append(&self.node);
+        if (!self.script.is_async) {
+            manager.evaluate();
+            return;
         }
-        manager.evaluate();
+        // async script can be evaluated immediately
+        defer self.deinit();
+        self.script.eval(manager.page);
     }
 
     fn errorCallback(self: *PendingScript, err: anyerror) void {
@@ -601,7 +559,7 @@ pub const PendingScript = struct {
 
         const script = &self.script;
         if (script.is_async) {
-            return if (self.complete) &self.manager.asyncs_ready else &self.manager.asyncs;
+            return &self.manager.asyncs;
         }
 
         if (script.is_defer) {
@@ -627,7 +585,7 @@ const Script = struct {
 
     const Callback = union(enum) {
         string: []const u8,
-        function: Env.Function,
+        function: js.Function,
     };
 
     const Source = union(enum) {
@@ -663,8 +621,8 @@ const Script = struct {
             .cacheable = cacheable,
         });
 
-        const js_context = page.main_context;
-        var try_catch: Env.TryCatch = undefined;
+        const js_context = page.js;
+        var try_catch: js.TryCatch = undefined;
         try_catch.init(js_context);
         defer try_catch.deinit();
 
@@ -706,11 +664,11 @@ const Script = struct {
 
         switch (callback) {
             .string => |str| {
-                var try_catch: Env.TryCatch = undefined;
-                try_catch.init(page.main_context);
+                var try_catch: js.TryCatch = undefined;
+                try_catch.init(page.js);
                 defer try_catch.deinit();
 
-                _ = page.main_context.exec(str, typ) catch |err| {
+                _ = page.js.exec(str, typ) catch |err| {
                     const msg = try_catch.err(page.arena) catch @errorName(err) orelse "unknown";
                     log.warn(.user_script, "script callback", .{
                         .url = self.url,
@@ -728,7 +686,7 @@ const Script = struct {
                 };
                 defer parser.eventDestroy(loadevt);
 
-                var result: Env.Function.Result = undefined;
+                var result: js.Function.Result = undefined;
                 const iface = Event.toInterface(loadevt);
                 f.tryCall(void, .{iface}, &result) catch {
                     log.warn(.user_script, "script callback", .{
