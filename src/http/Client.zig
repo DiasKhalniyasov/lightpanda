@@ -93,6 +93,11 @@ notification: ?*Notification = null,
 // restoring, this originally-configured value is what it goes to.
 http_proxy: ?[:0]const u8 = null,
 
+// track if the client use a proxy for connections.
+// We can't use http_proxy because we want also to track proxy configured via
+// CDP.
+use_proxy: bool,
+
 // The complete user-agent header line
 user_agent: [:0]const u8,
 
@@ -126,6 +131,7 @@ pub fn init(allocator: Allocator, ca_blob: ?c.curl_blob, opts: Http.Opts) !*Clie
         .handles = handles,
         .allocator = allocator,
         .http_proxy = opts.http_proxy,
+        .use_proxy = opts.http_proxy != null,
         .user_agent = opts.user_agent,
         .transfer_pool = transfer_pool,
     };
@@ -315,6 +321,7 @@ pub fn changeProxy(self: *Client, proxy: [:0]const u8) !void {
     for (self.handles.handles) |*h| {
         try errorCheck(c.curl_easy_setopt(h.conn.easy, c.CURLOPT_PROXY, proxy.ptr));
     }
+    self.use_proxy = true;
 }
 
 // Same restriction as changeProxy. Should be ok since this is only called on
@@ -325,6 +332,37 @@ pub fn restoreOriginalProxy(self: *Client) !void {
     const proxy = if (self.http_proxy) |p| p.ptr else null;
     for (self.handles.handles) |*h| {
         try errorCheck(c.curl_easy_setopt(h.conn.easy, c.CURLOPT_PROXY, proxy));
+    }
+    self.use_proxy = proxy != null;
+}
+
+// Enable TLS verification on all connections.
+pub fn enableTlsVerify(self: *const Client) !void {
+    for (self.handles.handles) |*h| {
+        const easy = h.conn.easy;
+
+        try errorCheck(c.curl_easy_setopt(easy, c.CURLOPT_SSL_VERIFYHOST, @as(c_long, 2)));
+        try errorCheck(c.curl_easy_setopt(easy, c.CURLOPT_SSL_VERIFYPEER, @as(c_long, 1)));
+
+        if (self.use_proxy) {
+            try errorCheck(c.curl_easy_setopt(easy, c.CURLOPT_PROXY_SSL_VERIFYHOST, @as(c_long, 2)));
+            try errorCheck(c.curl_easy_setopt(easy, c.CURLOPT_PROXY_SSL_VERIFYPEER, @as(c_long, 1)));
+        }
+    }
+}
+
+// Disable TLS verification on all connections.
+pub fn disableTlsVerify(self: *const Client) !void {
+    for (self.handles.handles) |*h| {
+        const easy = h.conn.easy;
+
+        try errorCheck(c.curl_easy_setopt(easy, c.CURLOPT_SSL_VERIFYHOST, @as(c_long, 0)));
+        try errorCheck(c.curl_easy_setopt(easy, c.CURLOPT_SSL_VERIFYPEER, @as(c_long, 0)));
+
+        if (self.use_proxy) {
+            try errorCheck(c.curl_easy_setopt(easy, c.CURLOPT_PROXY_SSL_VERIFYHOST, @as(c_long, 0)));
+            try errorCheck(c.curl_easy_setopt(easy, c.CURLOPT_PROXY_SSL_VERIFYPEER, @as(c_long, 0)));
+        }
     }
 }
 
@@ -393,7 +431,9 @@ fn perform(self: *Client, timeout_ms: c_int) !PerformStatus {
 
     // We're potentially going to block for a while until we get data. Process
     // whatever messages we have waiting ahead of time.
-    try self.processMessages();
+    if (try self.processMessages()) {
+        return .normal;
+    }
 
     var status = PerformStatus.normal;
     if (self.extra_socket) |s| {
@@ -411,12 +451,13 @@ fn perform(self: *Client, timeout_ms: c_int) !PerformStatus {
         try errorMCheck(c.curl_multi_poll(multi, null, 0, timeout_ms, null));
     }
 
-    try self.processMessages();
+    _ = try self.processMessages();
     return status;
 }
 
-fn processMessages(self: *Client) !void {
+fn processMessages(self: *Client) !bool {
     const multi = self.multi;
+    var processed = false;
     var messages_count: c_int = 0;
     while (c.curl_multi_info_read(multi, &messages_count)) |msg_| {
         const msg: *c.CURLMsg = @ptrCast(msg_);
@@ -475,10 +516,12 @@ fn processMessages(self: *Client) !void {
                     .transfer = transfer,
                 });
             }
+            processed = true;
         } else |err| {
             self.requestFailed(transfer, err);
         }
     }
+    return processed;
 }
 
 fn endTransfer(self: *Client, transfer: *Transfer) void {
@@ -803,7 +846,7 @@ pub const Transfer = struct {
         self.deinit();
     }
 
-    // abortAuthChallenge is called when an auth chanllenge interception is
+    // abortAuthChallenge is called when an auth challenge interception is
     // abort. We don't call self.client.endTransfer here b/c it has been done
     // before interception process.
     pub fn abortAuthChallenge(self: *Transfer) void {

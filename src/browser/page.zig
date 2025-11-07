@@ -24,6 +24,7 @@ const Allocator = std.mem.Allocator;
 const Dump = @import("dump.zig");
 const State = @import("State.zig");
 const Mime = @import("mime.zig").Mime;
+const Browser = @import("browser.zig").Browser;
 const Session = @import("session.zig").Session;
 const Renderer = @import("renderer.zig").Renderer;
 const Window = @import("html/window.zig").Window;
@@ -33,6 +34,9 @@ const Http = @import("../http/Http.zig");
 const ScriptManager = @import("ScriptManager.zig");
 const SlotChangeMonitor = @import("SlotChangeMonitor.zig");
 const HTMLDocument = @import("html/document.zig").HTMLDocument;
+
+const NavigationKind = @import("navigation/root.zig").NavigationKind;
+const NavigationCurrentEntryChangeEvent = @import("navigation/root.zig").NavigationCurrentEntryChangeEvent;
 
 const js = @import("js/js.zig");
 const URL = @import("../url.zig").URL;
@@ -146,11 +150,7 @@ pub const Page = struct {
         self.js = try session.executor.createContext(self, true, js.GlobalMissingCallback.init(&self.polyfill_loader));
         try polyfill.preload(self.arena, self.js);
 
-        try self.scheduler.add(self, runMicrotasks, 5, .{ .name = "page.microtasks" });
-        // message loop must run only non-test env
-        if (comptime !builtin.is_test) {
-            try self.scheduler.add(self, runMessageLoop, 5, .{ .name = "page.messageLoop" });
-        }
+        try self.registerBackgroundTasks();
     }
 
     pub fn deinit(self: *Page) void {
@@ -160,7 +160,10 @@ pub const Page = struct {
         self.script_manager.deinit();
     }
 
-    fn reset(self: *Page) void {
+    fn reset(self: *Page) !void {
+        // Force running the micro task to drain the queue.
+        self.session.browser.env.runMicrotasks();
+
         self.scheduler.reset();
         self.http_client.abort();
         self.script_manager.reset();
@@ -168,18 +171,31 @@ pub const Page = struct {
         self.load_state = .parsing;
         self.mode = .{ .pre = {} };
         _ = self.session.browser.page_arena.reset(.{ .retain_with_limit = 1 * 1024 * 1024 });
+
+        try self.registerBackgroundTasks();
     }
 
-    fn runMicrotasks(ctx: *anyopaque) ?u32 {
-        const self: *Page = @ptrCast(@alignCast(ctx));
-        self.session.browser.runMicrotasks();
-        return 5;
-    }
+    fn registerBackgroundTasks(self: *Page) !void {
+        if (comptime builtin.is_test) {
+            // HTML test runner manually calls these as necessary
+            return;
+        }
 
-    fn runMessageLoop(ctx: *anyopaque) ?u32 {
-        const self: *Page = @ptrCast(@alignCast(ctx));
-        self.session.browser.runMessageLoop();
-        return 100;
+        try self.scheduler.add(self.session.browser, struct {
+            fn runMicrotasks(ctx: *anyopaque) ?u32 {
+                const b: *Browser = @ptrCast(@alignCast(ctx));
+                b.runMicrotasks();
+                return 5;
+            }
+        }.runMicrotasks, 5, .{ .name = "page.microtasks" });
+
+        try self.scheduler.add(self.session.browser, struct {
+            fn runMessageLoop(ctx: *anyopaque) ?u32 {
+                const b: *Browser = @ptrCast(@alignCast(ctx));
+                b.runMessageLoop();
+                return 100;
+            }
+        }.runMessageLoop, 5, .{ .name = "page.messageLoop" });
     }
 
     pub const DumpOpts = struct {
@@ -472,16 +488,16 @@ pub const Page = struct {
         }
 
         {
-            std.debug.print("\nprimary schedule: {d}\n", .{self.scheduler.primary.count()});
-            var it = self.scheduler.primary.iterator();
+            std.debug.print("\nhigh_priority schedule: {d}\n", .{self.scheduler.high_priority.count()});
+            var it = self.scheduler.high_priority.iterator();
             while (it.next()) |task| {
                 std.debug.print(" - {s} schedule: {d}ms\n", .{ task.name, task.ms - now });
             }
         }
 
         {
-            std.debug.print("\nsecondary schedule: {d}\n", .{self.scheduler.secondary.count()});
-            var it = self.scheduler.secondary.iterator();
+            std.debug.print("\nlow_priority schedule: {d}\n", .{self.scheduler.low_priority.count()});
+            var it = self.scheduler.low_priority.iterator();
             while (it.next()) |task| {
                 std.debug.print(" - {s} schedule: {d}ms\n", .{ task.name, task.ms - now });
             }
@@ -526,7 +542,7 @@ pub const Page = struct {
         if (self.mode != .pre) {
             // it's possible for navigate to be called multiple times on the
             // same page (via CDP). We want to reset the page between each call.
-            self.reset();
+            try self.reset();
         }
 
         log.info(.http, "navigate", .{
@@ -536,14 +552,31 @@ pub const Page = struct {
             .body = opts.body != null,
         });
 
-        // if the url is about:blank, nothing to do.
+        // if the url is about:blank, we load an empty HTML document in the
+        // page and dispatch the events.
         if (std.mem.eql(u8, "about:blank", request_url)) {
             const html_doc = try parser.documentHTMLParseFromStr("");
             try self.setDocument(html_doc);
 
+            // Assume we parsed the document.
+            // It's important to force a reset during the following navigation.
+            self.mode = .parsed;
+
             // We do not processHTMLDoc here as we know we don't have any scripts
             // This assumption may be false when CDP Page.addScriptToEvaluateOnNewDocument is implemented
-            try HTMLDocument.documentIsComplete(self.window.document, self);
+            self.documentIsComplete();
+
+            self.session.browser.notification.dispatch(.page_navigate, &.{
+                .opts = opts,
+                .url = request_url,
+                .timestamp = timestamp(),
+            });
+
+            self.session.browser.notification.dispatch(.page_navigated, &.{
+                .url = request_url,
+                .timestamp = timestamp(),
+            });
+
             return;
         }
 
@@ -802,8 +835,8 @@ pub const Page = struct {
             },
         }
 
-        // Push the navigation after a successful load.
-        try self.session.history.pushNavigation(self.url.raw, self);
+        // We need to handle different navigation types differently.
+        try self.session.navigation.processNavigation(self);
     }
 
     fn pageErrorCallback(ctx: *anyopaque, err: anyerror) void {
@@ -836,7 +869,7 @@ pub const Page = struct {
         _ = self.session.browser.transfer_arena.reset(.{ .retain_with_limit = 4 * 1024 });
     }
 
-    // extracted because this sis called from tests to set things up.
+    // extracted because this is called from tests to set things up.
     pub fn setDocument(self: *Page, html_doc: *parser.DocumentHTML) !void {
         const doc = parser.documentHTMLToDocument(html_doc);
         try parser.documentSetDocumentURI(doc, self.url.raw);
@@ -846,7 +879,7 @@ pub const Page = struct {
         self.window.setStorageShelf(
             try self.session.storage_shed.getOrPut(try self.origin(self.arena)),
         );
-        try self.window.replaceLocation(.{ .url = try self.url.toWebApi(self.arena) });
+        try self.window.changeLocation(self.url.raw, self);
     }
 
     pub const MouseEvent = struct {
@@ -893,7 +926,7 @@ pub const Page = struct {
             .a => {
                 const element: *parser.Element = @ptrCast(node);
                 const href = (try parser.elementGetAttribute(element, "href")) orelse return;
-                try self.navigateFromWebAPI(href, .{});
+                try self.navigateFromWebAPI(href, .{}, .{ .push = null });
             },
             .input => {
                 const element: *parser.Element = @ptrCast(node);
@@ -1000,13 +1033,55 @@ pub const Page = struct {
         }
     }
 
+    // insertText is a shortcut to insert text into the active element.
+    pub fn insertText(self: *Page, v: []const u8) !void {
+        const Document = @import("dom/document.zig").Document;
+        const element = (try Document.getActiveElement(@ptrCast(self.window.document), self)) orelse return;
+        const node = parser.elementToNode(element);
+
+        const tag = (try parser.nodeHTMLGetTagType(node)) orelse return;
+        switch (tag) {
+            .input => {
+                const input_type = try parser.inputGetType(@ptrCast(element));
+                if (std.mem.eql(u8, input_type, "text")) {
+                    const value = try parser.inputGetValue(@ptrCast(element));
+                    const new_value = try std.mem.concat(self.arena, u8, &.{ value, v });
+                    try parser.inputSetValue(@ptrCast(element), new_value);
+                }
+            },
+            .textarea => {
+                const value = try parser.textareaGetValue(@ptrCast(node));
+                const new_value = try std.mem.concat(self.arena, u8, &.{ value, v });
+                try parser.textareaSetValue(@ptrCast(node), new_value);
+            },
+            else => {},
+        }
+    }
+
     // We cannot navigate immediately as navigating will delete the DOM tree,
     // which holds this event's node.
     // As such we schedule the function to be called as soon as possible.
     // The page.arena is safe to use here, but the transfer_arena exists
     // specifically for this type of lifetime.
-    pub fn navigateFromWebAPI(self: *Page, url: []const u8, opts: NavigateOpts) !void {
+    pub fn navigateFromWebAPI(self: *Page, url: []const u8, opts: NavigateOpts, kind: NavigationKind) !void {
         const session = self.session;
+        const stitched_url = try URL.stitch(session.transfer_arena, url, self.url.raw, .{ .alloc = .always });
+
+        // Force will force a page load.
+        // Otherwise, we need to check if this is a true navigation.
+        if (!opts.force) {
+            // If we are navigating within the same document, just change URL.
+            const new_url = try URL.parse(stitched_url, null);
+
+            if (try self.url.eqlDocument(&new_url, session.transfer_arena)) {
+                self.url = new_url;
+
+                const prev = session.navigation.currentEntry();
+                NavigationCurrentEntryChangeEvent.dispatch(&self.session.navigation, prev, kind);
+                return;
+            }
+        }
+
         if (session.queued_navigation != null) {
             // It might seem like this should never happen. And it might not,
             // BUT..consider the case where we have script like:
@@ -1029,8 +1104,10 @@ pub const Page = struct {
 
         session.queued_navigation = .{
             .opts = opts,
-            .url = try URL.stitch(session.transfer_arena, url, self.url.raw, .{ .alloc = .always }),
+            .url = stitched_url,
         };
+
+        session.navigation_kind = kind;
 
         self.http_client.abort();
 
@@ -1082,7 +1159,7 @@ pub const Page = struct {
         } else {
             action = try URL.concatQueryString(transfer_arena, action, buf.items);
         }
-        try self.navigateFromWebAPI(action, opts);
+        try self.navigateFromWebAPI(action, opts, .{ .push = null });
     }
 
     pub fn isNodeAttached(self: *const Page, node: *parser.Node) bool {
@@ -1140,6 +1217,7 @@ pub const NavigateReason = enum {
     form,
     script,
     history,
+    navigation,
 };
 
 pub const NavigateOpts = struct {
@@ -1148,6 +1226,7 @@ pub const NavigateOpts = struct {
     method: Http.Method = .GET,
     body: ?[]const u8 = null,
     header: ?[:0]const u8 = null,
+    force: bool = false,
 };
 
 const IdleNotification = union(enum) {

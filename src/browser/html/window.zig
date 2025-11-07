@@ -25,6 +25,7 @@ const Page = @import("../page.zig").Page;
 
 const Navigator = @import("navigator.zig").Navigator;
 const History = @import("History.zig");
+const Navigation = @import("../navigation/Navigation.zig");
 const Location = @import("location.zig").Location;
 const Crypto = @import("../crypto/crypto.zig").Crypto;
 const Console = @import("../console/console.zig").Console;
@@ -41,6 +42,9 @@ const Request = @import("../fetch/Request.zig");
 const fetchFn = @import("../fetch/fetch.zig").fetch;
 
 const storage = @import("../storage/storage.zig");
+const ErrorEvent = @import("error_event.zig").ErrorEvent;
+
+const DirectEventHandler = @import("../events/event.zig").DirectEventHandler;
 
 // https://dom.spec.whatwg.org/#interface-window-extensions
 // https://html.spec.whatwg.org/multipage/nav-history-apis.html#window
@@ -52,7 +56,7 @@ pub const Window = struct {
 
     document: *parser.DocumentHTML,
     target: []const u8 = "",
-    location: Location = .{},
+    location: Location,
     storage_shelf: ?*storage.Shelf = null,
 
     // counter for having unique timer ids
@@ -68,6 +72,7 @@ pub const Window = struct {
     scroll_x: u32 = 0,
     scroll_y: u32 = 0,
     onload_callback: ?js.Function = null,
+    onpopstate_callback: ?js.Function = null,
 
     pub fn create(target: ?[]const u8, navigator: ?Navigator) !Window {
         var fbs = std.io.fixedBufferStream("");
@@ -78,6 +83,7 @@ pub const Window = struct {
         return .{
             .document = html_doc,
             .target = target orelse "",
+            .location = try .init("about:blank"),
             .navigator = navigator orelse .{},
             .performance = Performance.init(),
         };
@@ -86,6 +92,10 @@ pub const Window = struct {
     pub fn replaceLocation(self: *Window, loc: Location) !void {
         self.location = loc;
         try parser.documentHTMLSetLocation(Location, self.document, &self.location);
+    }
+
+    pub fn changeLocation(self: *Window, new_url: []const u8, page: *Page) !void {
+        return self.location.url.reinit(new_url, page);
     }
 
     pub fn replaceDocument(self: *Window, doc: *parser.DocumentHTML) !void {
@@ -109,39 +119,17 @@ pub const Window = struct {
 
     /// Sets `onload_callback`.
     pub fn set_onload(self: *Window, maybe_listener: ?EventHandler.Listener, page: *Page) !void {
-        const event_target = parser.toEventTarget(Window, self);
-        const event_type = "load";
-
-        // Check if we have a listener set.
-        if (self.onload_callback) |callback| {
-            const listener = try parser.eventTargetHasListener(event_target, event_type, false, callback.id);
-            std.debug.assert(listener != null);
-            try parser.eventTargetRemoveEventListener(event_target, event_type, listener.?, false);
-        }
-
-        if (maybe_listener) |listener| {
-            switch (listener) {
-                // If an object is given as listener, do nothing.
-                .object => {},
-                .function => |callback| {
-                    _ = try EventHandler.register(page.arena, event_target, event_type, listener, null) orelse unreachable;
-                    self.onload_callback = callback;
-
-                    return;
-                },
-            }
-        }
-
-        // Just unset the listener.
-        self.onload_callback = null;
+        try DirectEventHandler(Window, self, "load", maybe_listener, &self.onload_callback, page.arena);
     }
 
-    pub fn get_window(self: *Window) *Window {
-        return self;
+    /// Returns `onpopstate_callback`.
+    pub fn get_onpopstate(self: *const Window) ?js.Function {
+        return self.onpopstate_callback;
     }
 
-    pub fn get_navigator(self: *Window) *Navigator {
-        return &self.navigator;
+    /// Sets `onpopstate_callback`.
+    pub fn set_onpopstate(self: *Window, maybe_listener: ?EventHandler.Listener, page: *Page) !void {
+        try DirectEventHandler(Window, self, "popstate", maybe_listener, &self.onpopstate_callback, page.arena);
     }
 
     pub fn get_location(self: *Window) *Location {
@@ -149,23 +137,7 @@ pub const Window = struct {
     }
 
     pub fn set_location(_: *const Window, url: []const u8, page: *Page) !void {
-        return page.navigateFromWebAPI(url, .{ .reason = .script });
-    }
-
-    pub fn get_console(self: *Window) *Console {
-        return &self.console;
-    }
-
-    pub fn get_crypto(self: *Window) *Crypto {
-        return &self.crypto;
-    }
-
-    pub fn get_self(self: *Window) *Window {
-        return self;
-    }
-
-    pub fn get_parent(self: *Window) *Window {
-        return self;
+        return page.navigateFromWebAPI(url, .{ .reason = .script }, .{ .push = null });
     }
 
     // frames return the window itself, but accessing it via a pseudo
@@ -205,16 +177,16 @@ pub const Window = struct {
         return frames.get_length();
     }
 
-    pub fn get_top(self: *Window) *Window {
-        return self;
-    }
-
     pub fn get_document(self: *Window) ?*parser.DocumentHTML {
         return self.document;
     }
 
     pub fn get_history(_: *Window, page: *Page) *History {
         return &page.session.history;
+    }
+
+    pub fn get_navigation(_: *Window, page: *Page) *Navigation {
+        return &page.session.navigation;
     }
 
     //  The interior height of the window in pixels, including the height of the horizontal scroll bar, if present.
@@ -241,14 +213,6 @@ pub const Window = struct {
     pub fn get_sessionStorage(self: *Window) !*storage.Bottle {
         if (self.storage_shelf == null) return parser.DOMError.NotSupported;
         return &self.storage_shelf.?.bucket.session;
-    }
-
-    pub fn get_performance(self: *Window) *Performance {
-        return &self.performance;
-    }
-
-    pub fn get_screen(self: *Window) *Screen {
-        return &self.screen;
     }
 
     pub fn get_CSS(self: *Window) *Css {
@@ -283,8 +247,8 @@ pub const Window = struct {
         _ = self.timers.remove(id);
     }
 
-    pub fn _queueMicrotask(self: *Window, cbk: js.Function, page: *Page) !u32 {
-        return self.createTimeout(cbk, 0, page, .{ .name = "queueMicrotask" });
+    pub fn _queueMicrotask(self: *Window, cbk: js.Function, page: *Page) !void {
+        _ = try self.createTimeout(cbk, 0, page, .{ .name = "queueMicrotask" });
     }
 
     pub fn _setImmediate(self: *Window, cbk: js.Function, page: *Page) !u32 {
@@ -315,6 +279,25 @@ pub const Window = struct {
         const out = try page.call_arena.alloc(u8, size);
         Decoder.decode(out, value) catch return error.InvalidCharacterError;
         return out;
+    }
+
+    pub fn _reportError(self: *Window, err: js.Object, page: *Page) !void {
+        var error_event = try ErrorEvent.constructor("error", .{
+            .@"error" = err,
+        });
+        _ = try parser.eventTargetDispatchEvent(
+            parser.toEventTarget(Window, self),
+            @as(*parser.Event, &error_event.proto),
+        );
+
+        if (parser.eventDefaultPrevented(&error_event.proto) == false) {
+            const err_string = err.toString() catch "Unknown error";
+            log.info(.user_script, "error", .{
+                .err = err_string,
+                .stack = page.stackTrace() catch "???",
+                .source = "window.reportError",
+            });
+        }
     }
 
     const CreateTimeoutOpts = struct {
@@ -462,6 +445,18 @@ pub const Window = struct {
         // we assume that this evt has already been dispatched on the document
         // and thus the target has already been set to the document.
         return self.base.redispatchEvent(evt);
+    }
+
+    pub fn postAttach(self: *Window, js_this: js.This) !void {
+        try js_this.set("top", self, .{});
+        try js_this.set("self", self, .{});
+        try js_this.set("parent", self, .{});
+        try js_this.set("window", self, .{});
+        try js_this.set("crypto", &self.crypto, .{});
+        try js_this.set("screen", &self.screen, .{});
+        try js_this.set("console", &self.console, .{});
+        try js_this.set("navigator", &self.navigator, .{});
+        try js_this.set("performance", &self.performance, .{});
     }
 };
 

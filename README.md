@@ -18,7 +18,7 @@ Lightpanda is the open-source browser made for headless usage:
 
 - Javascript execution
 - Support of Web APIs (partial, WIP)
-- Compatible with Playwright[^1], Puppeteer, chromedp through CDP
+- Compatible with Playwright[^1], Puppeteer, chromedp through [CDP](https://chromedevtools.github.io/devtools-protocol/)
 
 Fast web automation for AI agents, LLM training, scraping and testing:
 
@@ -164,7 +164,7 @@ You can also follow the progress of our Javascript support in our dedicated [zig
 
 ### Prerequisites
 
-Lightpanda is written with [Zig](https://ziglang.org/) `0.15.1`. You have to
+Lightpanda is written with [Zig](https://ziglang.org/) `0.15.2`. You have to
 install it with the right version in order to build the project.
 
 Lightpanda also depends on
@@ -190,10 +190,10 @@ For systems with [Nix](https://nixos.org/download/), you can use the devShell:
 nix develop
 ```
 
-For MacOS, you only need cmake:
+For MacOS, you need [Xcode](https://developer.apple.com/xcode/) and the following pacakges from homebrew:
 
 ```
-brew install cmake
+brew install cmake pkgconf
 ```
 
 ### Install and build dependencies

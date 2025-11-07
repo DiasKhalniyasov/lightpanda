@@ -29,6 +29,8 @@ isolate: v8.Isolate,
 v8_context: v8.Context,
 handle_scope: ?v8.HandleScope,
 
+cpu_profiler: ?v8.CpuProfiler = null,
+
 // references Env.templates
 templates: []v8.FunctionTemplate,
 
@@ -231,7 +233,6 @@ pub fn module(self: *Context, comptime want_result: bool, src: []const u8, url: 
             }
         }
     }
-    errdefer _ = self.module_cache.remove(url);
 
     const m = try compileModule(self.isolate, src, url);
 
@@ -251,18 +252,17 @@ pub fn module(self: *Context, comptime want_result: bool, src: []const u8, url: 
         for (0..requests.length()) |i| {
             const req = requests.get(v8_context, @intCast(i)).castTo(v8.ModuleRequest);
             const specifier = try self.jsStringToZig(req.getSpecifier(), .{});
-            const normalized_specifier = try @import("../../url.zig").stitch(
+            const normalized_specifier = try self.script_manager.?.resolveSpecifier(
                 self.call_arena,
                 specifier,
                 owned_url,
-                .{ .alloc = .if_needed, .null_terminated = true },
             );
             const gop = try self.module_cache.getOrPut(self.arena, normalized_specifier);
             if (!gop.found_existing) {
                 const owned_specifier = try self.arena.dupeZ(u8, normalized_specifier);
                 gop.key_ptr.* = owned_specifier;
                 gop.value_ptr.* = .{};
-                try self.script_manager.?.getModule(owned_specifier, src);
+                try self.script_manager.?.preloadImport(owned_specifier, url);
             }
         }
     }
@@ -271,7 +271,18 @@ pub fn module(self: *Context, comptime want_result: bool, src: []const u8, url: 
         return error.ModuleInstantiationError;
     }
 
-    const evaluated = try m.evaluate(v8_context);
+    const evaluated = m.evaluate(v8_context) catch {
+        std.debug.assert(m.getStatus() == .kErrored);
+
+        // Some module-loading errors aren't handled by TryCatch. We need to
+        // get the error from the module itself.
+        log.warn(.js, "evaluate module", .{
+            .specifier = owned_url,
+            .message = self.valueToString(m.getException(), .{}) catch "???",
+        });
+        return error.EvaluationError;
+    };
+
     // https://v8.github.io/api/head/classv8_1_1Module.html#a1f1758265a4082595757c3251bb40e0f
     // Must be a promise that gets returned here.
     std.debug.assert(evaluated.isPromise());
@@ -739,9 +750,16 @@ pub fn jsValueToZig(self: *Context, comptime named_function: NamedFunction, comp
             unreachable;
         },
         .@"enum" => |e| {
-            switch (@typeInfo(e.tag_type)) {
-                .int => return std.meta.intToEnum(T, try jsIntToZig(e.tag_type, js_value, self.v8_context)),
-                else => @compileError(named_function.full_name ++ " has an unsupported enum parameter type: " ++ @typeName(T)),
+            if (@hasDecl(T, "ENUM_JS_USE_TAG")) {
+                const str = try self.jsValueToZig(named_function, []const u8, js_value);
+                return std.meta.stringToEnum(T, str) orelse return error.InvalidEnumValue;
+            } else {
+                switch (@typeInfo(e.tag_type)) {
+                    .int => return std.meta.intToEnum(T, try jsIntToZig(e.tag_type, js_value, self.v8_context)),
+                    else => {
+                        @compileError(named_function.full_name ++ " has an unsupported enum parameter type: " ++ @typeName(T));
+                    },
+                }
             }
         },
         else => {},
@@ -1127,11 +1145,10 @@ pub fn dynamicModuleCallback(
         return @constCast(self.rejectPromise("Out of memory").handle);
     };
 
-    const normalized_specifier = @import("../../url.zig").stitch(
+    const normalized_specifier = self.script_manager.?.resolveSpecifier(
         self.arena, // might need to survive until the module is loaded
         specifier,
         resource,
-        .{ .alloc = .if_needed, .null_terminated = true },
     ) catch |err| {
         log.err(.app, "OOM", .{ .err = err, .src = "dynamicModuleCallback3" });
         return @constCast(self.rejectPromise("Out of memory").handle);
@@ -1171,11 +1188,10 @@ fn _resolveModuleCallback(self: *Context, referrer: v8.Module, specifier: []cons
         return error.UnknownModuleReferrer;
     };
 
-    const normalized_specifier = try @import("../../url.zig").stitch(
-        self.call_arena,
+    const normalized_specifier = try self.script_manager.?.resolveSpecifier(
+        self.arena, // might need to survive until the module is loaded
         specifier,
         referrer_path,
-        .{ .alloc = .if_needed, .null_terminated = true },
     );
 
     const gop = try self.module_cache.getOrPut(self.arena, normalized_specifier);
@@ -1197,24 +1213,32 @@ fn _resolveModuleCallback(self: *Context, referrer: v8.Module, specifier: []cons
         // harm in handling this case.
         @branchHint(.unlikely);
         gop.value_ptr.* = .{};
-        try self.script_manager.?.getModule(normalized_specifier, referrer_path);
+        try self.script_manager.?.preloadImport(normalized_specifier, referrer_path);
     }
 
-    var fetch_result = try self.script_manager.?.waitForModule(normalized_specifier);
-    defer fetch_result.deinit();
+    var source = try self.script_manager.?.waitForImport(normalized_specifier);
+    defer source.deinit();
 
     var try_catch: js.TryCatch = undefined;
     try_catch.init(self);
     defer try_catch.deinit();
 
-    const entry = self.module(true, fetch_result.src(), normalized_specifier, true) catch |err| {
-        log.warn(.js, "compile resolved module", .{
-            .specifier = specifier,
-            .stack = try_catch.stack(self.call_arena) catch null,
-            .src = try_catch.sourceLine(self.call_arena) catch "err",
-            .line = try_catch.sourceLineNumber() orelse 0,
-            .exception = (try_catch.exception(self.call_arena) catch @errorName(err)) orelse @errorName(err),
-        });
+    const entry = self.module(true, source.src(), normalized_specifier, true) catch |err| {
+        switch (err) {
+            error.EvaluationError => {
+                // This is a sentinel value telling us that the error was already
+                // logged. Some module-loading errors aren't captured by Try/Catch.
+                // We need to handle those errors differently, where the module
+                // exists.
+            },
+            else => log.warn(.js, "compile resolved module", .{
+                .specifier = normalized_specifier,
+                .stack = try_catch.stack(self.call_arena) catch null,
+                .src = try_catch.sourceLine(self.call_arena) catch "err",
+                .line = try_catch.sourceLineNumber() orelse 0,
+                .exception = (try_catch.exception(self.call_arena) catch @errorName(err)) orelse @errorName(err),
+            }),
+        }
         return null;
     };
     // entry.module is always set when returning from self.module()
@@ -1273,7 +1297,7 @@ fn _dynamicModuleCallback(self: *Context, specifier: [:0]const u8, referrer: []c
         };
 
         // Next, we need to actually load it.
-        self.script_manager.?.getAsyncModule(specifier, dynamicModuleSourceCallback, state, referrer) catch |err| {
+        self.script_manager.?.getAsyncImport(specifier, dynamicModuleSourceCallback, state, referrer) catch |err| {
             const error_msg = v8.String.initUtf8(isolate, @errorName(err));
             _ = resolver.reject(self.v8_context, error_msg.toValue());
         };
@@ -1306,24 +1330,24 @@ fn _dynamicModuleCallback(self: *Context, specifier: [:0]const u8, referrer: []c
     return promise;
 }
 
-fn dynamicModuleSourceCallback(ctx: *anyopaque, fetch_result_: anyerror!ScriptManager.GetResult) void {
+fn dynamicModuleSourceCallback(ctx: *anyopaque, module_source_: anyerror!ScriptManager.ModuleSource) void {
     const state: *DynamicModuleResolveState = @ptrCast(@alignCast(ctx));
     var self = state.context;
 
-    var fetch_result = fetch_result_ catch |err| {
+    var ms = module_source_ catch |err| {
         const error_msg = v8.String.initUtf8(self.isolate, @errorName(err));
         _ = state.resolver.castToPromiseResolver().reject(self.v8_context, error_msg.toValue());
         return;
     };
 
     const module_entry = blk: {
-        defer fetch_result.deinit();
+        defer ms.deinit();
 
         var try_catch: js.TryCatch = undefined;
         try_catch.init(self);
         defer try_catch.deinit();
 
-        break :blk self.module(true, fetch_result.src(), state.specifier, true) catch {
+        break :blk self.module(true, ms.src(), state.specifier, true) catch {
             const ex = try_catch.exception(self.call_arena) catch |err| @errorName(err) orelse "unknown error";
             log.err(.js, "module compilation failed", .{
                 .specifier = state.specifier,
@@ -1819,6 +1843,11 @@ fn zigJsonToJs(isolate: v8.Isolate, v8_context: v8.Context, value: std.json.Valu
     }
 }
 
+pub fn getGlobalThis(self: *Context) js.This {
+    const js_global = self.v8_context.getGlobal();
+    return .{ .obj = .{ .js_obj = js_global, .context = self } };
+}
+
 // == Misc ==
 // An interface for types that want to have their jsDeinit function to be
 // called when the call context ends
@@ -1847,3 +1876,26 @@ const DestructorCallback = struct {
         self.destructorFn(self.ptr);
     }
 };
+
+// == Profiler ==
+pub fn startCpuProfiler(self: *Context) void {
+    if (builtin.mode != .Debug) {
+        // Still testing this out, don't have it properly exposed, so add this
+        // guard for the time being to prevent any accidental/weird prod issues.
+        @compileError("CPU Profiling is only available in debug builds");
+    }
+
+    std.debug.assert(self.cpu_profiler == null);
+    v8.CpuProfiler.useDetailedSourcePositionsForProfiling(self.isolate);
+    const cpu_profiler = v8.CpuProfiler.init(self.isolate);
+    const title = self.isolate.initStringUtf8("v8_cpu_profile");
+    cpu_profiler.startProfiling(title);
+    self.cpu_profiler = cpu_profiler;
+}
+
+pub fn stopCpuProfiler(self: *Context) ![]const u8 {
+    const title = self.isolate.initStringUtf8("v8_cpu_profile");
+    const profile = self.cpu_profiler.?.stopProfiling(title) orelse unreachable;
+    const serialized = profile.serialize(self.isolate).?;
+    return self.jsStringToZig(serialized, .{});
+}
